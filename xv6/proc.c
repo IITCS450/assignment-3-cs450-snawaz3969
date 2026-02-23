@@ -88,6 +88,7 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
+  p->tickets = 1;
 
   release(&ptable.lock);
 
@@ -327,31 +328,44 @@ scheduler(void)
   c->proc = 0;
   
   for(;;){
-    // Enable interrupts on this processor.
     sti();
 
-    // Loop over process table looking for process to run.
     acquire(&ptable.lock);
+    // 1. Compute total tickets of RUNNABLE processes
+    int total = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      if(p->state == RUNNABLE)
+        total += p->tickets;
+    }
+
+    if(total == 0){
+      // No runnable process – release lock and try again
+      release(&ptable.lock);
+      continue;
+    }
+
+    // 2. Generate a random winner in [0, total) using per‑CPU LCG
+    if(c->rseed == 0) c->rseed = 1;               // initialise
+    uint winner = (c->rseed = c->rseed * 1103515245 + 12345) % total;
+
+    // 3. Scan runnable processes, accumulate tickets until winner is reached
+    int sum = 0;
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
       if(p->state != RUNNABLE)
         continue;
-
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
-      c->proc = p;
-      switchuvm(p);
-      p->state = RUNNING;
-
-      swtch(&(c->scheduler), p->context);
-      switchkvm();
-
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
-      c->proc = 0;
+      sum += p->tickets;
+      if(sum > winner){
+        // This process wins the lottery
+        c->proc = p;
+        switchuvm(p);
+        p->state = RUNNING;
+        swtch(&(c->scheduler), p->context);
+        switchkvm();
+        c->proc = 0;
+        break;          // done for this scheduling round
+      }
     }
     release(&ptable.lock);
-
   }
 }
 
@@ -531,4 +545,17 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+
+// Set tickets of current process. Must be called from syscall context.
+int
+setproctickets(int n)
+{
+  struct proc *curproc = myproc();
+  if (n < 1)
+    return -1;
+  acquire(&ptable.lock);
+  curproc->tickets = n;
+  release(&ptable.lock);
+  return 0;
 }
